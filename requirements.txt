@@ -4,4 +4,3 @@ sqlalchemy>=2.0.0
 pydantic>=2.7.0
 twilio>=9.0.0
 python-multipart>=0.0.9
-itsdangerous>=2.1.2
