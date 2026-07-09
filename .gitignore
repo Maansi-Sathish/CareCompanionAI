@@ -1,0 +1,15 @@
+# Ignore the Python virtual environment
+.venv/
+venv/
+ENV/
+
+# Ignore local database files
+*.db
+*.sqlite3
+
+# Ignore uploaded files in local testing
+uploads/
+
+# Ignore Python cache directories
+__pycache__/
+*.pyc
