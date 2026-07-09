@@ -247,6 +247,14 @@ ALERTS_SCRIPT = """
     function playBeep(freq, count) {
         try {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            // Defensive resume: if the context ever ends up suspended (e.g. the
+            // tab was backgrounded, or the browser auto-suspended it), nudge it
+            // back awake before scheduling tones. This does NOT establish the
+            // initial user-gesture unlock by itself -- see the click handler
+            // below for that -- but it keeps things reliable afterwards.
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
             let t = audioCtx.currentTime;
             for (let i = 0; i < count; i++) {
                 const osc = audioCtx.createOscillator();
@@ -324,12 +332,23 @@ ALERTS_SCRIPT = """
                 enableBtn.disabled = true;
             }
             enableBtn.addEventListener('click', function() {
+                // Create/resume the AudioContext synchronously, inside the
+                // click handler itself, BEFORE requesting notification
+                // permission. requestPermission() shows a real OS/browser
+                // dialog and its .then() callback fires well after the user
+                // gesture has expired, so any audio unlock attempted in
+                // there is too late and gets silently suspended forever.
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+                playBeep(1000, 1);
+
                 if (window.Notification) {
                     Notification.requestPermission().then(function(perm) {
                         if (perm === 'granted') {
                             enableBtn.textContent = '🔔 Alerts On';
                             enableBtn.disabled = true;
-                            playBeep(1000, 1);
                         }
                     });
                 }
