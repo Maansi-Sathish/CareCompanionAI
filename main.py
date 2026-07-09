@@ -1,4 +1,3 @@
-
 import os
 import sys
 import asyncio
@@ -66,6 +65,8 @@ class Appointment(Base):
     date_time = Column(String)
     hospital = Column(String)
     prescription_path = Column(String, nullable=True)
+    morning_alert_sent = Column(Boolean, default=False)   # "Doctor appointment today" alert
+    reminder_alert_sent = Column(Boolean, default=False)  # 30-minutes-before alert
 
 class CaregiverProfile(Base):
     __tablename__ = "caregiver_profiles"
@@ -107,8 +108,11 @@ async def background_monitoring_agent():
             current_date_str = now.strftime("%Y-%m-%d")
             current_weekday = now.strftime("%A")  # Get full day name (e.g., "Monday")
             
-            cg = db.query(CaregiverProfile).first()
-            cg_name = cg.name if cg else "Caregiver"
+            caregivers = db.query(CaregiverProfile).all()
+            if caregivers:
+                recipient_label = ", ".join(f"{c.name} ({c.phone})" for c in caregivers)
+            else:
+                recipient_label = "No caregivers configured"
 
             # 1. Active Medication Compliance Tracker Loop
             medicines = db.query(Medicine).all()
@@ -146,7 +150,7 @@ async def background_monitoring_agent():
                                 
                                 new_log = NotificationLog(
                                     medicine_name=med.name,
-                                    recipient=f"{cg_name} ({cg.phone if cg else 'SMS'})",
+                                    recipient=recipient_label,
                                     status="ALERT: Medication missed past 10-minute safe threshold!",
                                     event_type="MISSED ESCALATION"
                                 )
@@ -160,12 +164,45 @@ async def background_monitoring_agent():
             for appt in appointments:
                 try:
                     appt_dt = datetime.strptime(appt.date_time, "%Y-%m-%d %H:%M")
+
+                    # 2a. Morning-of alert: "Doctor appointment today" (fires once, any time
+                    # from midnight onward on the appointment's date, so a brief server restart
+                    # can't cause it to be skipped entirely)
+                    if (
+                        appt_dt.strftime("%Y-%m-%d") == current_date_str
+                        and not appt.morning_alert_sent
+                        and now <= appt_dt
+                    ):
+                        print(f"[📅 TODAY] Doctor appointment today with Dr. {appt.doctor_name} ({appt.specialty}).")
+                        trigger_hardware_beep(frequency=800, duration=350, count=3)
+                        db.add(NotificationLog(
+                            medicine_name=f"Appointment: Dr. {appt.doctor_name}",
+                            recipient=recipient_label,
+                            status="REMINDER: Doctor appointment today!",
+                            event_type="APPT_MORNING"
+                        ))
+                        appt.morning_alert_sent = True
+                        db.commit()
+
+                    # 2b. 30-minutes-before alert (fires once, from the 30-min mark onward,
+                    # so it isn't missed if the exact minute is skipped by a restart)
                     alert_window = appt_dt - timedelta(minutes=30)
-                    if alert_window.strftime("%Y-%m-%d %H:%M") == now.strftime("%Y-%m-%d %H:%M"):
+                    if (
+                        not appt.reminder_alert_sent
+                        and alert_window <= now < appt_dt
+                    ):
                         print(f"[🚨 RADAR] Appointment proximity alert! 30 mins remaining.")
                         trigger_hardware_beep(frequency=600, duration=300, count=3)
-                except Exception:
-                    pass
+                        db.add(NotificationLog(
+                            medicine_name=f"Appointment: Dr. {appt.doctor_name}",
+                            recipient=recipient_label,
+                            status="REMINDER: Appointment in 30 minutes!",
+                            event_type="APPT_30MIN"
+                        ))
+                        appt.reminder_alert_sent = True
+                        db.commit()
+                except Exception as e:
+                    print(f"[ERROR AGENT] Appointment processing error: {e}")
 
             # 3. Midnight Routine Compliance Resets
             if now.strftime("%H:%M:%S") == "00:00:00":
@@ -246,7 +283,8 @@ def page_home():
     db = SessionLocal()
     medicines = db.query(Medicine).all()
     appointments = db.query(Appointment).all()
-    cg = db.query(CaregiverProfile).first()
+    caregivers = db.query(CaregiverProfile).all()
+    caregiver_names = ", ".join(c.name for c in caregivers) if caregivers else "None configured"
     db.close()
 
     med_cards = ""
@@ -290,7 +328,7 @@ def page_home():
     <div class="space-y-8">
         <div class="border-b border-white/10 pb-4">
             <h2 class="text-3xl font-extrabold text-white">Central Ecosystem Dashboard</h2>
-            <p class="text-slate-400 text-sm">System Welcome Screen. Linked Caregiver Node: <span class="text-indigo-300 font-bold">{cg.name if cg else 'None'}</span></p>
+            <p class="text-slate-400 text-sm">System Welcome Screen. Linked Caregiver(s): <span class="text-indigo-300 font-bold">{caregiver_names}</span></p>
         </div>
         
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -406,35 +444,51 @@ def page_appointments():
 @app.get("/caregiver/setup", response_class=HTMLResponse)
 def page_caregiver_setup():
     db = SessionLocal()
-    cg = db.query(CaregiverProfile).first()
+    caregivers = db.query(CaregiverProfile).all()
     db.close()
-    
+
+    caregiver_cards = ""
+    for cg in caregivers:
+        caregiver_cards += f"""
+        <div class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl flex justify-between items-start">
+            <div>
+                <p class="text-sm">Name: <span class="text-white font-bold">{cg.name}</span></p>
+                <p class="text-sm mt-1">Phone: <span class="text-white font-mono">{cg.phone}</span></p>
+                <p class="text-sm mt-1">Email: <span class="text-white font-mono">{cg.email}</span></p>
+            </div>
+            <form action="/caregiver/delete/{cg.id}" method="POST">
+                <button type="submit" class="bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 text-xs font-bold px-3 py-1.5 rounded-xl transition">Remove</button>
+            </form>
+        </div>
+        """
+    if not caregiver_cards:
+        caregiver_cards = '<p class="text-slate-500 text-xs italic">No caregivers added yet.</p>'
+
     content = f"""
     <div class="space-y-6 max-w-xl">
         <div class="border-b border-white/10 pb-4">
             <h2 class="text-2xl font-extrabold text-white">Caregiver Node Configuration</h2>
-            <p class="text-slate-400 text-sm">Configure target endpoints for routing alert and compliance messages.</p>
+            <p class="text-slate-400 text-sm">Add one or more caregivers to receive alert and compliance messages.</p>
         </div>
-        <div class="bg-white/5 border border-white/10 rounded-2xl p-6 shadow-xl mb-6">
-            <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3">Active Pipeline Coordinates</h3>
-            <p class="text-sm">Name: <span class="text-white font-bold">{cg.name if cg else 'None'}</span></p>
-            <p class="text-sm mt-1">Phone Target: <span class="text-white font-mono">{cg.phone if cg else 'None'}</span></p>
-            <p class="text-sm mt-1">Email Target: <span class="text-white font-mono">{cg.email if cg else 'None'}</span></p>
+        <div class="space-y-4">
+            <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest">Registered Caregivers ({len(caregivers)})</h3>
+            {caregiver_cards}
         </div>
-        <form action="/caregiver/update" method="POST" class="bg-white/5 border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl">
+        <form action="/caregiver/add" method="POST" class="bg-white/5 border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl">
+            <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Add New Caregiver</h3>
             <div>
                 <label class="block text-xs font-bold text-slate-400 mb-1">CAREGIVER NAME</label>
-                <input type="text" name="name" value="{cg.name if cg else ''}" required class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                <input type="text" name="name" required class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
             </div>
             <div>
                 <label class="block text-xs font-bold text-slate-400 mb-1">MOBILE CONTACT LINK</label>
-                <input type="text" name="phone" value="{cg.phone if cg else ''}" required class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                <input type="text" name="phone" required class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
             </div>
             <div>
                 <label class="block text-xs font-bold text-slate-400 mb-1">EMAIL DOMAIN PATH</label>
-                <input type="email" name="email" value="{cg.email if cg else ''}" required class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                <input type="email" name="email" required class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
             </div>
-            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-4 rounded-xl transition text-xs tracking-wider uppercase">Save Configuration Matrix</button>
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-4 rounded-xl transition text-xs tracking-wider uppercase">Add Caregiver</button>
         </form>
     </div>
     """
@@ -551,16 +605,16 @@ def action_add_med(
 def action_take_med(med_id: int):
     db = SessionLocal()
     med = db.query(Medicine).filter(Medicine.id == med_id).first()
-    cg = db.query(CaregiverProfile).first()
-    cg_name = cg.name if cg else "Caregiver"
-    
+    caregivers = db.query(CaregiverProfile).all()
+    recipient_label = ", ".join(f"{c.name} ({c.phone})" for c in caregivers) if caregivers else "No caregivers configured"
+
     if med:
         med.is_taken_today = True
         
         # LOG SUCCESS INTENT PIECE DIRECTLY INTO AUDIT MATRIX ROOM
         db.add(NotificationLog(
             medicine_name=med.name,
-            recipient=f"{cg_name} ({cg.phone if cg else 'SMS'})",
+            recipient=recipient_label,
             status="SUCCESS: Medicine verified taken on time!",
             event_type="SUCCESS"
         ))
@@ -587,17 +641,21 @@ async def action_add_appt(
     db.close()
     return RedirectResponse(url="/", status_code=303)
 
-@app.post("/caregiver/update")
-def action_update_cg(name: str = Form(...), phone: str = Form(...), email: str = Form(...)):
+@app.post("/caregiver/add")
+def action_add_cg(name: str = Form(...), phone: str = Form(...), email: str = Form(...)):
     db = SessionLocal()
-    cg = db.query(CaregiverProfile).first()
-    if cg:
-        cg.name = name
-        cg.phone = phone
-        cg.email = email
-    else:
-        db.add(CaregiverProfile(name=name, phone=phone, email=email))
+    db.add(CaregiverProfile(name=name, phone=phone, email=email))
     db.commit()
+    db.close()
+    return RedirectResponse(url="/caregiver/setup", status_code=303)
+
+@app.post("/caregiver/delete/{cg_id}")
+def action_delete_cg(cg_id: int):
+    db = SessionLocal()
+    cg = db.query(CaregiverProfile).filter(CaregiverProfile.id == cg_id).first()
+    if cg:
+        db.delete(cg)
+        db.commit()
     db.close()
     return RedirectResponse(url="/caregiver/setup", status_code=303)
 
@@ -605,4 +663,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main.py:app" if "__file__" not in globals() else f"{os.path.basename(__file__)[:-3]}:app", host="0.0.0.0", port=port, reload=False)
-
