@@ -6,11 +6,24 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Form, File, UploadFile, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 
 import sqlalchemy
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
+# -----------------------------------------------------------------------------
+# ACCESS CONTROL CONFIG
+# -----------------------------------------------------------------------------
+# Set these as real Environment Variables in Render (or a .env locally) —
+# never leave the fallback defaults in place for a public deployment.
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme123")
+SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", "dev-only-secret-change-me")
+
+# Paths that should be reachable WITHOUT being logged in
+PUBLIC_PATHS = {"/login"}
+
 
 # -----------------------------------------------------------------------------
 # HARDWARE AUDIO BUZZER DRIVERS (5-BEEP SEQUENCER)
@@ -99,6 +112,20 @@ db_init.close()
 app = FastAPI(title="CareCompanionAI Multi-Page App Engine")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+@app.middleware("http")
+async def require_login_gate(request: Request, call_next):
+    path = request.url.path
+    is_public = path in PUBLIC_PATHS or path.startswith("/uploads")
+    if not is_public and not request.session.get("logged_in"):
+        return RedirectResponse(url="/login")
+    return await call_next(request)
+
+# NOTE: SessionMiddleware must be added AFTER the custom middleware above so that
+# it ends up as the OUTER layer (Starlette applies middleware in reverse
+# registration order) — otherwise request.session isn't ready yet when the
+# login gate checks it.
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
+
 async def background_monitoring_agent():
     while True:
         db = SessionLocal()
@@ -131,6 +158,13 @@ async def background_monitoring_agent():
                     if med.scheduled_time == current_time_str and not med.is_taken_today:
                         print(f"[⏰ ALARM TARGET] {med.name} due now. Executing 5 hardware tones.")
                         trigger_hardware_beep(frequency=1000, duration=400, count=5)
+                        db.add(NotificationLog(
+                            medicine_name=med.name,
+                            recipient=recipient_label,
+                            status=f"DUE NOW: Time to take {med.name} ({med.dosage})",
+                            event_type="MEDICINE_DUE"
+                        ))
+                        db.commit()
 
                     # 10-Minute Grace Window Violation Ceiling Trigger (5 high beeps)
                     try:
@@ -223,6 +257,120 @@ async def start_background_workers():
 # -----------------------------------------------------------------------------
 # GLOBAL EMBEDDED NAVIGATION WRAPPER COMPONENT
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# BROWSER-SIDE ALERTS (real audio + pop-ups, since a cloud server has no
+# speaker of its own — this plays sound and shows notifications on whichever
+# device actually has the site open)
+# -----------------------------------------------------------------------------
+ALERTS_SCRIPT = """
+<div id="ccai-toast-container" style="position:fixed; top:16px; right:16px; z-index:9999; display:flex; flex-direction:column; gap:10px; max-width:320px;"></div>
+<script>
+(function() {
+    const STORAGE_KEY = 'ccai_last_log_id';
+    let audioCtx = null;
+
+    function playBeep(freq, count) {
+        try {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            let t = audioCtx.currentTime;
+            for (let i = 0; i < count; i++) {
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                gain.gain.value = 0.2;
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start(t);
+                osc.stop(t + 0.35);
+                t += 0.5;
+            }
+        } catch (e) { console.error('Beep failed:', e); }
+    }
+
+    function showToast(title, body) {
+        const container = document.getElementById('ccai-toast-container');
+        if (!container) return;
+        const toast = document.createElement('div');
+        toast.style.cssText = "background:#0f172a; border:1px solid rgba(99,102,241,0.4); border-radius:14px; padding:14px 16px; box-shadow:0 20px 40px rgba(0,0,0,0.4); animation: ccaiSlideIn 0.25s ease-out;";
+        toast.innerHTML = "<p style='font-size:12px; font-weight:800; color:#a5b4fc; margin:0;'>" + title + "</p><p style='font-size:12px; color:#cbd5e1; margin:4px 0 0 0;'>" + body + "</p>";
+        container.appendChild(toast);
+        setTimeout(function() { toast.remove(); }, 15000);
+    }
+
+    function notifyBrowser(title, body) {
+        if (window.Notification && Notification.permission === 'granted') {
+            try { new Notification(title, { body: body }); } catch (e) {}
+        }
+    }
+
+    function handleEvent(log) {
+        var title, freq, count;
+        if (log.event_type === 'MEDICINE_DUE') { title = '⏰ Medicine Due'; freq = 1000; count = 5; }
+        else if (log.event_type === 'MISSED ESCALATION') { title = '⚠️ Missed Dose Alert'; freq = 2100; count = 5; }
+        else if (log.event_type === 'APPT_MORNING') { title = '📅 Appointment Today'; freq = 800; count = 3; }
+        else if (log.event_type === 'APPT_30MIN') { title = '🚨 Appointment Soon'; freq = 600; count = 3; }
+        else { return; }
+        showToast(title, log.status);
+        notifyBrowser(title, log.status);
+        playBeep(freq, count);
+    }
+
+    async function pollLogs() {
+        try {
+            const res = await fetch('/api/raw/logs');
+            if (!res.ok) return;
+            const logs = await res.json();
+            if (!logs.length) return;
+            const lastSeen = parseInt(localStorage.getItem(STORAGE_KEY) || '0', 10);
+            const newOnes = logs.filter(function(l) { return l.id > lastSeen; }).sort(function(a, b) { return a.id - b.id; });
+            newOnes.forEach(handleEvent);
+            const maxId = Math.max.apply(null, logs.map(function(l) { return l.id; }));
+            localStorage.setItem(STORAGE_KEY, maxId);
+        } catch (e) { console.error(e); }
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        // On the very first visit ever, seed the "last seen" id so old history
+        // doesn't all fire as pop-ups at once.
+        if (!localStorage.getItem(STORAGE_KEY)) {
+            fetch('/api/raw/logs').then(function(r) { return r.json(); }).then(function(logs) {
+                const maxId = logs.length ? Math.max.apply(null, logs.map(function(l) { return l.id; })) : 0;
+                localStorage.setItem(STORAGE_KEY, maxId);
+            });
+        }
+        pollLogs();
+        setInterval(pollLogs, 20000);
+
+        const enableBtn = document.getElementById('ccai-enable-alerts');
+        if (enableBtn) {
+            if (window.Notification && Notification.permission === 'granted') {
+                enableBtn.textContent = '🔔 Alerts On';
+                enableBtn.disabled = true;
+            }
+            enableBtn.addEventListener('click', function() {
+                if (window.Notification) {
+                    Notification.requestPermission().then(function(perm) {
+                        if (perm === 'granted') {
+                            enableBtn.textContent = '🔔 Alerts On';
+                            enableBtn.disabled = true;
+                            playBeep(1000, 1);
+                        }
+                    });
+                }
+            });
+        }
+    });
+})();
+</script>
+<style>
+@keyframes ccaiSlideIn {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+</style>
+"""
+
 def get_shared_layout(page_title: str, main_content: str) -> str:
     return f"""
     <!DOCTYPE html>
@@ -263,21 +411,79 @@ def get_shared_layout(page_title: str, main_content: str) -> str:
                         </a>
                     </nav>
                 </div>
-                <div class="text-[11px] text-slate-500 border-t border-white/10 pt-4">True Multi-Page Routing Stack v3.2</div>
+                <div class="border-t border-white/10 pt-4 space-y-2">
+                    <button id="ccai-enable-alerts" class="w-full flex items-center justify-center space-x-2 px-4 py-2 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 text-indigo-300 transition font-semibold text-xs">🔔 Enable Alerts</button>
+                    <a href="/logout" class="w-full flex items-center space-x-2 px-4 py-2 rounded-xl hover:bg-red-500/10 text-red-300 transition font-semibold text-xs block">🔒 Log Out</a>
+                    <div class="text-[11px] text-slate-500 px-4">True Multi-Page Routing Stack v3.2</div>
+                </div>
             </aside>
             <main class="flex-1 p-6 md:p-10 max-w-5xl mx-auto w-full overflow-hidden">
                 {main_content}
             </main>
         </div>
+        {ALERTS_SCRIPT}
     </body>
     </html>
     """
 
 # -----------------------------------------------------------------------------
+# LOGIN / LOGOUT
+# -----------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+def page_login(error: str = None):
+    error_box = ""
+    if error:
+        error_box = '<p class="text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2 text-xs font-semibold mb-4">Incorrect password. Please try again.</p>'
+
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>CareCompanionAI - Login</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+            body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}
+        </style>
+    </head>
+    <body class="bg-gradient-to-tr from-slate-950 via-slate-900 to-indigo-950 min-h-screen text-slate-100 antialiased flex items-center justify-center p-6">
+        <div class="w-full max-w-sm">
+            <div class="text-center mb-8">
+                <div class="text-4xl mb-3">🛡️</div>
+                <h1 class="text-2xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent">CareCompanion</h1>
+                <p class="text-slate-400 text-sm mt-1">Enter the access password to continue</p>
+            </div>
+            <form action="/login" method="POST" class="bg-white/5 border border-white/10 rounded-2xl p-6 shadow-xl space-y-4">
+                {error_box}
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 mb-1">PASSWORD</label>
+                    <input type="password" name="password" required autofocus placeholder="••••••••" class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                </div>
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-4 rounded-xl transition text-xs tracking-wider uppercase shadow-lg shadow-indigo-600/20">Unlock Dashboard</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """)
+
+@app.post("/login")
+def action_login(request: Request, password: str = Form(...)):
+    if password == APP_PASSWORD:
+        request.session["logged_in"] = True
+        return RedirectResponse(url="/", status_code=303)
+    return RedirectResponse(url="/login?error=1", status_code=303)
+
+@app.get("/logout")
+def action_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=303)
+
+# -----------------------------------------------------------------------------
 # REAL ROUTED PAGES CHANNELS
 # -----------------------------------------------------------------------------
 
-# PAGE ROUTE 1: ENTRY DASHBOARD VIEW (URL: /)
 @app.get("/", response_class=HTMLResponse)
 def page_home():
     db = SessionLocal()
