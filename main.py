@@ -62,10 +62,6 @@ def decode_jwt_payload(token: str):
         return None
 
 
-def verify_jwt_token(token: str) -> bool:
-    return decode_jwt_payload(token) is not None
-
-
 def get_current_user(request: Request):
     """Returns the User row for the logged-in visitor, or None."""
     token = request.cookies.get(COOKIE_NAME)
@@ -127,6 +123,20 @@ def trigger_hardware_beep(frequency: int, duration: int, count: int = 5):
 # -----------------------------------------------------------------------------
 # DATABASE STORAGE ARCHITECTURE
 # -----------------------------------------------------------------------------
+# IMPORTANT (Render free tier): the default sqlite file below lives on an
+# EPHEMERAL disk. Every redeploy / spin-down-then-wake wipes it, so all
+# users, medicines, appointments, and — critically — the `users` table
+# itself get recreated empty. Any browser that still has an old JWT cookie
+# from before the wipe now points at a uid that no longer exists in the DB.
+# That mismatch (not the JWT check itself, which still "passes") is what
+# was causing the Internal Server Error on "/": the login gate let the
+# request through because the token's signature was still valid, but
+# current_user came back None and the very next line touched current_user.id.
+# The require_login_gate middleware below now checks that the user row
+# actually still exists, not just that the token is well-formed. For this
+# to stop recurring altogether on every redeploy, set DATABASE_URL to a
+# real persistent Postgres instance (e.g. Render's managed Postgres, or
+# Supabase) instead of relying on local sqlite in production.
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///carecompanion.db")
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -199,8 +209,30 @@ async def require_login_gate(request: Request, call_next):
     is_public = path in PUBLIC_PATHS or path.startswith("/uploads")
     if not is_public:
         token = request.cookies.get(COOKIE_NAME)
-        if not token or not verify_jwt_token(token):
+        payload = decode_jwt_payload(token) if token else None
+        if not payload:
             return RedirectResponse(url="/login")
+
+        # The token's signature being valid is NOT enough on its own — it
+        # only proves the cookie was issued by this server at some point.
+        # It does not prove the user it points to still exists in the
+        # database right now (see the ephemeral-disk note above DATABASE_URL).
+        # Confirm the row is really there before letting the request through,
+        # and if it isn't, clear the stale cookie and bounce to /login
+        # instead of letting every downstream route crash on a None user.
+        db = SessionLocal()
+        try:
+            user_still_exists = (
+                db.query(User.id).filter(User.id == payload.get("uid")).first() is not None
+            )
+        finally:
+            db.close()
+
+        if not user_still_exists:
+            resp = RedirectResponse(url="/login")
+            resp.delete_cookie(COOKIE_NAME)
+            return resp
+
     return await call_next(request)
 
 async def background_monitoring_agent():
@@ -231,7 +263,7 @@ async def background_monitoring_agent():
                         days_list = [d.strip() for d in med.selected_days.split(",")]
                         if current_weekday in days_list:
                             is_due_today = True
-    
+
                     if is_due_today:
                         # Trigger exactly 5 sharp beeps at the exact scheduled target window
                         if med.scheduled_time == current_time_str and not med.is_taken_today:
@@ -245,7 +277,7 @@ async def background_monitoring_agent():
                                 event_type="MEDICINE_DUE"
                             ))
                             db.commit()
-    
+
                         # 10-Minute Grace Window Violation Ceiling Trigger (5 high beeps)
                         try:
                             med_time = datetime.strptime(med.scheduled_time, "%H:%M")
@@ -274,13 +306,13 @@ async def background_monitoring_agent():
                                     db.commit()
                         except Exception as e:
                             print(f"[ERROR AGENT] Delta processing error: {e}")
-    
+
                 # 2. Appointment Radar Warnings
                 appointments = db.query(Appointment).filter(Appointment.user_id == user.id).all()
                 for appt in appointments:
                     try:
                         appt_dt = datetime.strptime(appt.date_time, "%Y-%m-%d %H:%M")
-    
+
                         # 2a. Morning-of alert: "Doctor appointment today" (fires once, any time
                         # from midnight onward on the appointment's date, so a brief server restart
                         # can't cause it to be skipped entirely)
@@ -300,7 +332,7 @@ async def background_monitoring_agent():
                             ))
                             appt.morning_alert_sent = True
                             db.commit()
-    
+
                         # 2b. 30-minutes-before alert (fires once, from the 30-min mark onward,
                         # so it isn't missed if the exact minute is skipped by a restart)
                         alert_window = appt_dt - timedelta(minutes=30)
@@ -321,7 +353,7 @@ async def background_monitoring_agent():
                             db.commit()
                     except Exception as e:
                         print(f"[ERROR AGENT] Appointment processing error: {e}")
-    
+
             # 3. Midnight Routine Compliance Resets
             if now.strftime("%H:%M:%S") == "00:00:00":
                 db.query(Medicine).update({Medicine.is_taken_today: False})
@@ -356,11 +388,6 @@ ALERTS_SCRIPT = """
     function playBeep(freq, count) {
         try {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            // Defensive resume: if the context ever ends up suspended (e.g. the
-            // tab was backgrounded, or the browser auto-suspended it), nudge it
-            // back awake before scheduling tones. This does NOT establish the
-            // initial user-gesture unlock by itself -- see the click handler
-            // below for that -- but it keeps things reliable afterwards.
             if (audioCtx.state === 'suspended') {
                 audioCtx.resume();
             }
@@ -423,8 +450,6 @@ ALERTS_SCRIPT = """
     }
 
     document.addEventListener('DOMContentLoaded', function() {
-        // On the very first visit ever, seed the "last seen" id so old history
-        // doesn't all fire as pop-ups at once.
         if (!localStorage.getItem(STORAGE_KEY)) {
             fetch('/api/raw/logs').then(function(r) { return r.json(); }).then(function(logs) {
                 const maxId = logs.length ? Math.max.apply(null, logs.map(function(l) { return l.id; })) : 0;
@@ -441,12 +466,6 @@ ALERTS_SCRIPT = """
                 enableBtn.disabled = true;
             }
             enableBtn.addEventListener('click', function() {
-                // Create/resume the AudioContext synchronously, inside the
-                // click handler itself, BEFORE requesting notification
-                // permission. requestPermission() shows a real OS/browser
-                // dialog and its .then() callback fires well after the user
-                // gesture has expired, so any audio unlock attempted in
-                // there is too late and gets silently suspended forever.
                 if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 if (audioCtx.state === 'suspended') {
                     audioCtx.resume();
@@ -467,8 +486,6 @@ ALERTS_SCRIPT = """
         const testBtn = document.getElementById('ccai-test-alert');
         if (testBtn) {
             testBtn.addEventListener('click', function() {
-                // Same click-gesture unlock as the Enable Alerts button, so
-                // Test Alert works even if the user never clicked that one.
                 if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 if (audioCtx.state === 'suspended') { audioCtx.resume(); }
                 handleEvent({
@@ -714,11 +731,6 @@ def action_logout():
 # -----------------------------------------------------------------------------
 # HEALTH CHECK (public — no auth required)
 # -----------------------------------------------------------------------------
-# Ping this endpoint with a free uptime service (UptimeRobot, cron-job.org,
-# etc.) every ~10 minutes. Render's free tier spins a service down after ~15
-# minutes of no traffic — and while it's asleep, the background monitoring
-# agent isn't running either, so NO alerts (beeps, pop-ups, or otherwise) can
-# fire. Keeping this endpoint pinged keeps the whole alert system alive.
 @app.get("/health")
 def health_check():
     return {"status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -841,7 +853,6 @@ def page_medicines(request: Request):
         </form>
     </div>
     <script>
-        // Inline layout logic showing checkboxes only when 'custom' is picked
         function toggleDayMatrix() {
             const select = document.getElementById('freq-select');
             const panel = document.getElementById('day-matrix-panel');
@@ -1037,7 +1048,6 @@ def action_add_med(
     frequency_type: str = Form(...),
 ):
     current_user = get_current_user(request)
-    # Synchronously parse custom list elements from multi-select options if custom frequency is flagged
     db = SessionLocal()
     try:
         days_string = "All"
@@ -1068,8 +1078,6 @@ def action_take_med(request: Request, med_id: int):
 
     if med:
         med.is_taken_today = True
-        
-        # LOG SUCCESS INTENT PIECE DIRECTLY INTO AUDIT MATRIX ROOM
         db.add(NotificationLog(
             user_id=current_user.id,
             medicine_name=med.name,
