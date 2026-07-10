@@ -1,6 +1,8 @@
 import os
 import sys
 import asyncio
+import hashlib
+import secrets
 from datetime import datetime, timedelta
 
 import jwt
@@ -9,24 +11,22 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import sqlalchemy
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 # -----------------------------------------------------------------------------
-# JWT AUTHENTICATION CONFIG
+# JWT AUTHENTICATION CONFIG (real per-user accounts, not a single shared login)
 # -----------------------------------------------------------------------------
-# Set these as real Environment Variables in Render — never leave the
-# fallback defaults in place for a public deployment.
-APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme123")
+# Set this as a real Environment Variable in Render — never leave the
+# fallback default in place for a public deployment.
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-only-secret-change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 12
 COOKIE_NAME = "access_token"
 
 # Paths reachable WITHOUT a valid token
-PUBLIC_PATHS = {"/login", "/health"}
+PUBLIC_PATHS = {"/login", "/signup", "/health"}
 
 # Very simple in-memory brute-force throttle: after 5 failed attempts from the
 # same IP, lock that IP out of /login for 60 seconds. Resets on server restart
@@ -36,21 +36,49 @@ LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCKOUT_SECONDS = 60
 
 
-def create_jwt_token(username: str) -> str:
+def hash_password(password: str, salt: str) -> str:
+    """PBKDF2-HMAC-SHA256, 100k iterations — stdlib only, no extra dependency."""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 100_000).hex()
+
+
+def verify_password(password: str, salt: str, expected_hash: str) -> bool:
+    return secrets.compare_digest(hash_password(password, salt), expected_hash)
+
+
+def create_jwt_token(user) -> str:
     payload = {
-        "sub": username,
+        "sub": user.username,
+        "uid": user.id,
         "iat": datetime.utcnow(),
         "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def verify_jwt_token(token: str) -> bool:
+def decode_jwt_payload(token: str):
     try:
-        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return True
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
-        return False
+        return None
+
+
+def verify_jwt_token(token: str) -> bool:
+    return decode_jwt_payload(token) is not None
+
+
+def get_current_user(request: Request):
+    """Returns the User row for the logged-in visitor, or None."""
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        return None
+    payload = decode_jwt_payload(token)
+    if not payload:
+        return None
+    db = SessionLocal()
+    try:
+        return db.query(User).filter(User.id == payload.get("uid")).first()
+    finally:
+        db.close()
 
 
 def is_ip_locked_out(ip: str) -> bool:
@@ -107,9 +135,18 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    password_salt = Column(String)
+    created_at = Column(String, default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
 class Medicine(Base):
     __tablename__ = "medicines"
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     name = Column(String, index=True)
     dosage = Column(String)
     scheduled_time = Column(String)
@@ -120,6 +157,7 @@ class Medicine(Base):
 class Appointment(Base):
     __tablename__ = "appointments"
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     doctor_name = Column(String)
     specialty = Column(String)
     date_time = Column(String)
@@ -131,6 +169,7 @@ class Appointment(Base):
 class CaregiverProfile(Base):
     __tablename__ = "caregiver_profiles"
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     name = Column(String, default="Not Configured")
     phone = Column(String, default="None")
     email = Column(String, default="None")
@@ -138,6 +177,7 @@ class CaregiverProfile(Base):
 class NotificationLog(Base):
     __tablename__ = "notification_logs"
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     timestamp = Column(String, default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     medicine_name = Column(String)
     recipient = Column(String)
@@ -146,12 +186,6 @@ class NotificationLog(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# Initialize caregiver profile layer baseline row
-db_init = SessionLocal()
-if db_init.query(CaregiverProfile).count() == 0:
-    db_init.add(CaregiverProfile(name="Primary Caregiver", phone="Not Added", email="Not Added"))
-    db_init.commit()
-db_init.close()
 
 # -----------------------------------------------------------------------------
 # ASYNCHRONOUS INTELLIGENT WORKER AGENTS
@@ -177,110 +211,117 @@ async def background_monitoring_agent():
             current_time_str = now.strftime("%H:%M")
             current_date_str = now.strftime("%Y-%m-%d")
             current_weekday = now.strftime("%A")  # Get full day name (e.g., "Monday")
-            
-            caregivers = db.query(CaregiverProfile).all()
-            if caregivers:
-                recipient_label = ", ".join(f"{c.name} ({c.phone})" for c in caregivers)
-            else:
-                recipient_label = "No caregivers configured"
 
-            # 1. Active Medication Compliance Tracker Loop
-            medicines = db.query(Medicine).all()
-            for med in medicines:
-                # Determine if the medicine is scheduled for today
-                is_due_today = False
-                if med.frequency_type == "daily":
-                    is_due_today = True
-                elif med.frequency_type == "custom" and med.selected_days:
-                    days_list = [d.strip() for d in med.selected_days.split(",")]
-                    if current_weekday in days_list:
+            all_users = db.query(User).all()
+            for user in all_users:
+                caregivers = db.query(CaregiverProfile).filter(CaregiverProfile.user_id == user.id).all()
+                if caregivers:
+                    recipient_label = ", ".join(f"{c.name} ({c.phone})" for c in caregivers)
+                else:
+                    recipient_label = "No caregivers configured"
+
+                # 1. Active Medication Compliance Tracker Loop
+                medicines = db.query(Medicine).filter(Medicine.user_id == user.id).all()
+                for med in medicines:
+                    # Determine if the medicine is scheduled for today
+                    is_due_today = False
+                    if med.frequency_type == "daily":
                         is_due_today = True
-
-                if is_due_today:
-                    # Trigger exactly 5 sharp beeps at the exact scheduled target window
-                    if med.scheduled_time == current_time_str and not med.is_taken_today:
-                        print(f"[⏰ ALARM TARGET] {med.name} due now. Executing 5 hardware tones.")
-                        trigger_hardware_beep(frequency=1000, duration=400, count=5)
-                        db.add(NotificationLog(
-                            medicine_name=med.name,
-                            recipient=recipient_label,
-                            status=f"DUE NOW: Time to take {med.name} ({med.dosage})",
-                            event_type="MEDICINE_DUE"
-                        ))
-                        db.commit()
-
-                    # 10-Minute Grace Window Violation Ceiling Trigger (5 high beeps)
-                    try:
-                        med_time = datetime.strptime(med.scheduled_time, "%H:%M")
-                        target_alert_time = (med_time + timedelta(minutes=10)).strftime("%H:%M")
-                        
-                        if current_time_str == target_alert_time and not med.is_taken_today:
-                            existing_log = db.query(NotificationLog).filter(
-                                NotificationLog.medicine_name == med.name,
-                                NotificationLog.event_type == "MISSED ESCALATION",
-                                NotificationLog.timestamp.like(f"{current_date_str} {current_time_str[:-1]}%")
-                            ).first()
+                    elif med.frequency_type == "custom" and med.selected_days:
+                        days_list = [d.strip() for d in med.selected_days.split(",")]
+                        if current_weekday in days_list:
+                            is_due_today = True
+    
+                    if is_due_today:
+                        # Trigger exactly 5 sharp beeps at the exact scheduled target window
+                        if med.scheduled_time == current_time_str and not med.is_taken_today:
+                            print(f"[⏰ ALARM TARGET] {med.name} due now. Executing 5 hardware tones.")
+                            trigger_hardware_beep(frequency=1000, duration=400, count=5)
+                            db.add(NotificationLog(
+                                user_id=user.id,
+                                medicine_name=med.name,
+                                recipient=recipient_label,
+                                status=f"DUE NOW: Time to take {med.name} ({med.dosage})",
+                                event_type="MEDICINE_DUE"
+                            ))
+                            db.commit()
+    
+                        # 10-Minute Grace Window Violation Ceiling Trigger (5 high beeps)
+                        try:
+                            med_time = datetime.strptime(med.scheduled_time, "%H:%M")
+                            target_alert_time = (med_time + timedelta(minutes=10)).strftime("%H:%M")
                             
-                            if not existing_log:
-                                print(f"[⚠️ ESCALATION] 10-min grace expired for {med.name}. Dispatching alert to caregiver.")
-                                trigger_hardware_beep(frequency=2100, duration=500, count=5)
+                            if current_time_str == target_alert_time and not med.is_taken_today:
+                                existing_log = db.query(NotificationLog).filter(
+                                    NotificationLog.user_id == user.id,
+                                    NotificationLog.medicine_name == med.name,
+                                    NotificationLog.event_type == "MISSED ESCALATION",
+                                    NotificationLog.timestamp.like(f"{current_date_str} {current_time_str[:-1]}%")
+                                ).first()
                                 
-                                new_log = NotificationLog(
-                                    medicine_name=med.name,
-                                    recipient=recipient_label,
-                                    status="ALERT: Medication missed past 10-minute safe threshold!",
-                                    event_type="MISSED ESCALATION"
-                                )
-                                db.add(new_log)
-                                db.commit()
+                                if not existing_log:
+                                    print(f"[⚠️ ESCALATION] 10-min grace expired for {med.name}. Dispatching alert to caregiver.")
+                                    trigger_hardware_beep(frequency=2100, duration=500, count=5)
+                                    
+                                    new_log = NotificationLog(
+                                        user_id=user.id,
+                                        medicine_name=med.name,
+                                        recipient=recipient_label,
+                                        status="ALERT: Medication missed past 10-minute safe threshold!",
+                                        event_type="MISSED ESCALATION"
+                                    )
+                                    db.add(new_log)
+                                    db.commit()
+                        except Exception as e:
+                            print(f"[ERROR AGENT] Delta processing error: {e}")
+    
+                # 2. Appointment Radar Warnings
+                appointments = db.query(Appointment).filter(Appointment.user_id == user.id).all()
+                for appt in appointments:
+                    try:
+                        appt_dt = datetime.strptime(appt.date_time, "%Y-%m-%d %H:%M")
+    
+                        # 2a. Morning-of alert: "Doctor appointment today" (fires once, any time
+                        # from midnight onward on the appointment's date, so a brief server restart
+                        # can't cause it to be skipped entirely)
+                        if (
+                            appt_dt.strftime("%Y-%m-%d") == current_date_str
+                            and not appt.morning_alert_sent
+                            and now <= appt_dt
+                        ):
+                            print(f"[📅 TODAY] Doctor appointment today with Dr. {appt.doctor_name} ({appt.specialty}).")
+                            trigger_hardware_beep(frequency=800, duration=350, count=3)
+                            db.add(NotificationLog(
+                                user_id=user.id,
+                                medicine_name=f"Appointment: Dr. {appt.doctor_name}",
+                                recipient=recipient_label,
+                                status="REMINDER: Doctor appointment today!",
+                                event_type="APPT_MORNING"
+                            ))
+                            appt.morning_alert_sent = True
+                            db.commit()
+    
+                        # 2b. 30-minutes-before alert (fires once, from the 30-min mark onward,
+                        # so it isn't missed if the exact minute is skipped by a restart)
+                        alert_window = appt_dt - timedelta(minutes=30)
+                        if (
+                            not appt.reminder_alert_sent
+                            and alert_window <= now < appt_dt
+                        ):
+                            print(f"[🚨 RADAR] Appointment proximity alert! 30 mins remaining.")
+                            trigger_hardware_beep(frequency=600, duration=300, count=3)
+                            db.add(NotificationLog(
+                                user_id=user.id,
+                                medicine_name=f"Appointment: Dr. {appt.doctor_name}",
+                                recipient=recipient_label,
+                                status="REMINDER: Appointment in 30 minutes!",
+                                event_type="APPT_30MIN"
+                            ))
+                            appt.reminder_alert_sent = True
+                            db.commit()
                     except Exception as e:
-                        print(f"[ERROR AGENT] Delta processing error: {e}")
-
-            # 2. Appointment Radar Warnings
-            appointments = db.query(Appointment).all()
-            for appt in appointments:
-                try:
-                    appt_dt = datetime.strptime(appt.date_time, "%Y-%m-%d %H:%M")
-
-                    # 2a. Morning-of alert: "Doctor appointment today" (fires once, any time
-                    # from midnight onward on the appointment's date, so a brief server restart
-                    # can't cause it to be skipped entirely)
-                    if (
-                        appt_dt.strftime("%Y-%m-%d") == current_date_str
-                        and not appt.morning_alert_sent
-                        and now <= appt_dt
-                    ):
-                        print(f"[📅 TODAY] Doctor appointment today with Dr. {appt.doctor_name} ({appt.specialty}).")
-                        trigger_hardware_beep(frequency=800, duration=350, count=3)
-                        db.add(NotificationLog(
-                            medicine_name=f"Appointment: Dr. {appt.doctor_name}",
-                            recipient=recipient_label,
-                            status="REMINDER: Doctor appointment today!",
-                            event_type="APPT_MORNING"
-                        ))
-                        appt.morning_alert_sent = True
-                        db.commit()
-
-                    # 2b. 30-minutes-before alert (fires once, from the 30-min mark onward,
-                    # so it isn't missed if the exact minute is skipped by a restart)
-                    alert_window = appt_dt - timedelta(minutes=30)
-                    if (
-                        not appt.reminder_alert_sent
-                        and alert_window <= now < appt_dt
-                    ):
-                        print(f"[🚨 RADAR] Appointment proximity alert! 30 mins remaining.")
-                        trigger_hardware_beep(frequency=600, duration=300, count=3)
-                        db.add(NotificationLog(
-                            medicine_name=f"Appointment: Dr. {appt.doctor_name}",
-                            recipient=recipient_label,
-                            status="REMINDER: Appointment in 30 minutes!",
-                            event_type="APPT_30MIN"
-                        ))
-                        appt.reminder_alert_sent = True
-                        db.commit()
-                except Exception as e:
-                    print(f"[ERROR AGENT] Appointment processing error: {e}")
-
+                        print(f"[ERROR AGENT] Appointment processing error: {e}")
+    
             # 3. Midnight Routine Compliance Resets
             if now.strftime("%H:%M:%S") == "00:00:00":
                 db.query(Medicine).update({Medicine.is_taken_today: False})
@@ -447,7 +488,7 @@ ALERTS_SCRIPT = """
 </style>
 """
 
-def get_shared_layout(page_title: str, main_content: str) -> str:
+def get_shared_layout(page_title: str, main_content: str, username: str = "") -> str:
     return f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -467,7 +508,7 @@ def get_shared_layout(page_title: str, main_content: str) -> str:
                 <div>
                     <div class="mb-8">
                         <h1 class="text-2xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent">🛡️ CareCompanion</h1>
-                        <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-2 py-0.5 rounded-full font-bold mt-2 inline-block">PRODUCTION NODE ACTIVE</span>
+                        <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-2 py-0.5 rounded-full font-bold mt-2 inline-block">👤 {username}</span>
                     </div>
                     <nav class="space-y-2">
                         <a href="/" class="w-full flex items-center space-x-3 px-4 py-3 rounded-xl hover:bg-white/10 text-slate-300 transition font-semibold text-sm block">
@@ -504,7 +545,91 @@ def get_shared_layout(page_title: str, main_content: str) -> str:
     """
 
 # -----------------------------------------------------------------------------
-# LOGIN / LOGOUT (JWT-based)
+# SIGNUP (create a real account)
+# -----------------------------------------------------------------------------
+@app.get("/signup", response_class=HTMLResponse)
+def page_signup(error: str = None):
+    error_box = ""
+    if error == "taken":
+        error_box = '<p class="text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2 text-xs font-semibold mb-4">That username is already taken.</p>'
+    elif error == "short":
+        error_box = '<p class="text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2 text-xs font-semibold mb-4">Password must be at least 6 characters.</p>'
+
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>CareCompanionAI - Sign Up</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+            body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}
+        </style>
+    </head>
+    <body class="bg-gradient-to-tr from-slate-950 via-slate-900 to-indigo-950 min-h-screen text-slate-100 antialiased flex items-center justify-center p-6">
+        <div class="w-full max-w-sm">
+            <div class="text-center mb-8">
+                <div class="text-4xl mb-3">🛡️</div>
+                <h1 class="text-2xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent">CareCompanion</h1>
+                <p class="text-slate-400 text-sm mt-1">Create your account</p>
+            </div>
+            <form action="/signup" method="POST" class="bg-white/5 border border-white/10 rounded-2xl p-6 shadow-xl space-y-4">
+                {error_box}
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 mb-1">CHOOSE A USERNAME</label>
+                    <input type="text" name="username" required autofocus minlength="3" class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 mb-1">CHOOSE A PASSWORD</label>
+                    <input type="password" name="password" required minlength="6" placeholder="At least 6 characters" class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                </div>
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-4 rounded-xl transition text-xs tracking-wider uppercase shadow-lg shadow-indigo-600/20">Create Account</button>
+            </form>
+            <p class="text-center text-xs text-slate-500 mt-4">Already have an account? <a href="/login" class="text-indigo-300 font-semibold hover:underline">Sign in</a></p>
+        </div>
+    </body>
+    </html>
+    """)
+
+@app.post("/signup")
+def action_signup(username: str = Form(...), password: str = Form(...)):
+    username = username.strip()
+    if len(password) < 6:
+        return RedirectResponse(url="/signup?error=short", status_code=303)
+
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.username == username).first()
+        if existing:
+            return RedirectResponse(url="/signup?error=taken", status_code=303)
+
+        salt = secrets.token_hex(16)
+        new_user = User(
+            username=username,
+            password_hash=hash_password(password, salt),
+            password_salt=salt,
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        token = create_jwt_token(new_user)
+    finally:
+        db.close()
+
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=JWT_EXPIRY_HOURS * 3600,
+    )
+    return resp
+
+# -----------------------------------------------------------------------------
+# LOGIN / LOGOUT (JWT-based, per-user accounts)
 # -----------------------------------------------------------------------------
 @app.get("/login", response_class=HTMLResponse)
 def page_login(error: str = None):
@@ -538,7 +663,7 @@ def page_login(error: str = None):
                 {error_box}
                 <div>
                     <label class="block text-xs font-bold text-slate-400 mb-1">USERNAME</label>
-                    <input type="text" name="username" required autofocus placeholder="admin" class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                    <input type="text" name="username" required autofocus class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
                 </div>
                 <div>
                     <label class="block text-xs font-bold text-slate-400 mb-1">PASSWORD</label>
@@ -546,6 +671,7 @@ def page_login(error: str = None):
                 </div>
                 <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-4 rounded-xl transition text-xs tracking-wider uppercase shadow-lg shadow-indigo-600/20">Sign In</button>
             </form>
+            <p class="text-center text-xs text-slate-500 mt-4">Don't have an account? <a href="/signup" class="text-indigo-300 font-semibold hover:underline">Sign up</a></p>
         </div>
     </body>
     </html>
@@ -558,18 +684,23 @@ def action_login(request: Request, username: str = Form(...), password: str = Fo
     if is_ip_locked_out(client_ip):
         return RedirectResponse(url="/login?error=locked", status_code=303)
 
-    if username == APP_USERNAME and password == APP_PASSWORD:
-        _failed_login_attempts.pop(client_ip, None)
-        token = create_jwt_token(username)
-        resp = RedirectResponse(url="/", status_code=303)
-        resp.set_cookie(
-            key=COOKIE_NAME,
-            value=token,
-            httponly=True,
-            samesite="lax",
-            max_age=JWT_EXPIRY_HOURS * 3600,
-        )
-        return resp
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == username.strip()).first()
+        if user and verify_password(password, user.password_salt, user.password_hash):
+            _failed_login_attempts.pop(client_ip, None)
+            token = create_jwt_token(user)
+            resp = RedirectResponse(url="/", status_code=303)
+            resp.set_cookie(
+                key=COOKIE_NAME,
+                value=token,
+                httponly=True,
+                samesite="lax",
+                max_age=JWT_EXPIRY_HOURS * 3600,
+            )
+            return resp
+    finally:
+        db.close()
 
     register_failed_login(client_ip)
     return RedirectResponse(url="/login?error=1", status_code=303)
@@ -597,11 +728,12 @@ def health_check():
 # -----------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-def page_home():
+def page_home(request: Request):
+    current_user = get_current_user(request)
     db = SessionLocal()
-    medicines = db.query(Medicine).all()
-    appointments = db.query(Appointment).all()
-    caregivers = db.query(CaregiverProfile).all()
+    medicines = db.query(Medicine).filter(Medicine.user_id == current_user.id).all()
+    appointments = db.query(Appointment).filter(Appointment.user_id == current_user.id).all()
+    caregivers = db.query(CaregiverProfile).filter(CaregiverProfile.user_id == current_user.id).all()
     caregiver_names = ", ".join(c.name for c in caregivers) if caregivers else "None configured"
     db.close()
 
@@ -661,11 +793,12 @@ def page_home():
         </div>
     </div>
     """
-    return HTMLResponse(content=get_shared_layout("Home Entry", content))
+    return HTMLResponse(content=get_shared_layout("Home Entry", content, current_user.username))
 
 # PAGE ROUTE 2: ADD MEDICINES VIEW (URL: /medicines)
 @app.get("/medicines", response_class=HTMLResponse)
-def page_medicines():
+def page_medicines(request: Request):
+    current_user = get_current_user(request)
     content = """
     <div class="space-y-6 max-w-xl">
         <div class="border-b border-white/10 pb-4">
@@ -720,11 +853,12 @@ def page_medicines():
         }
     </script>
     """
-    return HTMLResponse(content=get_shared_layout("Add Medicines", content))
+    return HTMLResponse(content=get_shared_layout("Add Medicines", content, current_user.username))
 
 # PAGE ROUTE 3: ADD APPOINTMENTS VIEW (URL: /appointments)
 @app.get("/appointments", response_class=HTMLResponse)
-def page_appointments():
+def page_appointments(request: Request):
+    current_user = get_current_user(request)
     content = """
     <div class="space-y-6 max-w-xl">
         <div class="border-b border-white/10 pb-4">
@@ -756,13 +890,14 @@ def page_appointments():
         </form>
     </div>
     """
-    return HTMLResponse(content=get_shared_layout("Add Appointments", content))
+    return HTMLResponse(content=get_shared_layout("Add Appointments", content, current_user.username))
 
 # PAGE ROUTE 4: CAREGIVER CONFIGURATION SETUP VIEW (URL: /caregiver/setup)
 @app.get("/caregiver/setup", response_class=HTMLResponse)
-def page_caregiver_setup():
+def page_caregiver_setup(request: Request):
+    current_user = get_current_user(request)
     db = SessionLocal()
-    caregivers = db.query(CaregiverProfile).all()
+    caregivers = db.query(CaregiverProfile).filter(CaregiverProfile.user_id == current_user.id).all()
     db.close()
 
     caregiver_cards = ""
@@ -810,11 +945,12 @@ def page_caregiver_setup():
         </form>
     </div>
     """
-    return HTMLResponse(content=get_shared_layout("Caregiver Setup", content))
+    return HTMLResponse(content=get_shared_layout("Caregiver Setup", content, current_user.username))
 
 # PAGE ROUTE 5: CAREGIVER DUAL TELEMETRY LOGGER (URL: /caregiver/logs)
 @app.get("/caregiver/logs", response_class=HTMLResponse)
-def page_caregiver_logs():
+def page_caregiver_logs(request: Request):
+    current_user = get_current_user(request)
     content = """
     <div class="space-y-6">
         <div class="border-b border-white/10 pb-4 flex justify-between items-center">
@@ -878,16 +1014,17 @@ def page_caregiver_logs():
         });
     </script>
     """
-    return HTMLResponse(content=get_shared_layout("Caregiver Messages", content))
+    return HTMLResponse(content=get_shared_layout("Caregiver Messages", content, current_user.username))
 
 # -----------------------------------------------------------------------------
 # ACTION PROCESSING BACKEND LOGIC PIPELINES
 # -----------------------------------------------------------------------------
 @app.get("/api/raw/logs")
-def api_raw_logs():
+def api_raw_logs(request: Request):
+    current_user = get_current_user(request)
     db = SessionLocal()
     try:
-        return db.query(NotificationLog).order_by(NotificationLog.id.desc()).all()
+        return db.query(NotificationLog).filter(NotificationLog.user_id == current_user.id).order_by(NotificationLog.id.desc()).all()
     finally:
         db.close()
 
@@ -899,6 +1036,7 @@ def action_add_med(
     scheduled_time: str = Form(...),
     frequency_type: str = Form(...),
 ):
+    current_user = get_current_user(request)
     # Synchronously parse custom list elements from multi-select options if custom frequency is flagged
     db = SessionLocal()
     try:
@@ -911,6 +1049,7 @@ def action_add_med(
             days_string = ",".join(selected_days_list) if selected_days_list else "Monday"
 
         db.add(Medicine(
+            user_id=current_user.id,
             name=name, dosage=dosage, scheduled_time=scheduled_time,
             frequency_type=frequency_type, selected_days=days_string
         ))
@@ -920,10 +1059,11 @@ def action_add_med(
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/medicines/take/{med_id}")
-def action_take_med(med_id: int):
+def action_take_med(request: Request, med_id: int):
+    current_user = get_current_user(request)
     db = SessionLocal()
-    med = db.query(Medicine).filter(Medicine.id == med_id).first()
-    caregivers = db.query(CaregiverProfile).all()
+    med = db.query(Medicine).filter(Medicine.id == med_id, Medicine.user_id == current_user.id).first()
+    caregivers = db.query(CaregiverProfile).filter(CaregiverProfile.user_id == current_user.id).all()
     recipient_label = ", ".join(f"{c.name} ({c.phone})" for c in caregivers) if caregivers else "No caregivers configured"
 
     if med:
@@ -931,6 +1071,7 @@ def action_take_med(med_id: int):
         
         # LOG SUCCESS INTENT PIECE DIRECTLY INTO AUDIT MATRIX ROOM
         db.add(NotificationLog(
+            user_id=current_user.id,
             medicine_name=med.name,
             recipient=recipient_label,
             status="SUCCESS: Medicine verified taken on time!",
@@ -942,10 +1083,12 @@ def action_take_med(med_id: int):
 
 @app.post("/appointments/add")
 async def action_add_appt(
+    request: Request,
     doctor_name: str = Form(...), specialty: str = Form(...),
     date_time: str = Form(...), hospital: str = Form(...),
     prescription: UploadFile = File(None)
 ):
+    current_user = get_current_user(request)
     db = SessionLocal()
     formatted_dt = date_time.replace("T", " ")
     file_path = None
@@ -954,23 +1097,25 @@ async def action_add_appt(
         with open(file_path, "wb") as buffer:
             buffer.write(await prescription.read())
             
-    db.add(Appointment(doctor_name=doctor_name, specialty=specialty, date_time=formatted_dt, hospital=hospital, prescription_path=file_path))
+    db.add(Appointment(user_id=current_user.id, doctor_name=doctor_name, specialty=specialty, date_time=formatted_dt, hospital=hospital, prescription_path=file_path))
     db.commit()
     db.close()
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/caregiver/add")
-def action_add_cg(name: str = Form(...), phone: str = Form(...), email: str = Form(...)):
+def action_add_cg(request: Request, name: str = Form(...), phone: str = Form(...), email: str = Form(...)):
+    current_user = get_current_user(request)
     db = SessionLocal()
-    db.add(CaregiverProfile(name=name, phone=phone, email=email))
+    db.add(CaregiverProfile(user_id=current_user.id, name=name, phone=phone, email=email))
     db.commit()
     db.close()
     return RedirectResponse(url="/caregiver/setup", status_code=303)
 
 @app.post("/caregiver/delete/{cg_id}")
-def action_delete_cg(cg_id: int):
+def action_delete_cg(request: Request, cg_id: int):
+    current_user = get_current_user(request)
     db = SessionLocal()
-    cg = db.query(CaregiverProfile).filter(CaregiverProfile.id == cg_id).first()
+    cg = db.query(CaregiverProfile).filter(CaregiverProfile.id == cg_id, CaregiverProfile.user_id == current_user.id).first()
     if cg:
         db.delete(cg)
         db.commit()
