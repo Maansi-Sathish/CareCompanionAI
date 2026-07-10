@@ -3,7 +3,8 @@ import sys
 import asyncio
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Form, File, UploadFile, Request, HTTPException
+import jwt
+from fastapi import FastAPI, Form, File, UploadFile, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -11,6 +12,63 @@ import sqlalchemy
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
+# -----------------------------------------------------------------------------
+# JWT AUTHENTICATION CONFIG
+# -----------------------------------------------------------------------------
+# Set these as real Environment Variables in Render — never leave the
+# fallback defaults in place for a public deployment.
+APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme123")
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-only-secret-change-me")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 12
+COOKIE_NAME = "access_token"
+
+# Paths reachable WITHOUT a valid token
+PUBLIC_PATHS = {"/login", "/health"}
+
+# Very simple in-memory brute-force throttle: after 5 failed attempts from the
+# same IP, lock that IP out of /login for 60 seconds. Resets on server restart
+# (fine for a small demo app; a real production app would use Redis instead).
+_failed_login_attempts = {}  # ip -> (count, first_failure_timestamp)
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 60
+
+
+def create_jwt_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_jwt_token(token: str) -> bool:
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return True
+    except jwt.PyJWTError:
+        return False
+
+
+def is_ip_locked_out(ip: str) -> bool:
+    entry = _failed_login_attempts.get(ip)
+    if not entry:
+        return False
+    count, first_fail = entry
+    if count < LOGIN_MAX_ATTEMPTS:
+        return False
+    if (datetime.utcnow() - first_fail).total_seconds() > LOGIN_LOCKOUT_SECONDS:
+        _failed_login_attempts.pop(ip, None)
+        return False
+    return True
+
+
+def register_failed_login(ip: str):
+    count, first_fail = _failed_login_attempts.get(ip, (0, datetime.utcnow()))
+    _failed_login_attempts[ip] = (count + 1, first_fail)
 
 
 
@@ -100,6 +158,16 @@ db_init.close()
 # -----------------------------------------------------------------------------
 app = FastAPI(title="CareCompanionAI Multi-Page App Engine")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+@app.middleware("http")
+async def require_login_gate(request: Request, call_next):
+    path = request.url.path
+    is_public = path in PUBLIC_PATHS or path.startswith("/uploads")
+    if not is_public:
+        token = request.cookies.get(COOKIE_NAME)
+        if not token or not verify_jwt_token(token):
+            return RedirectResponse(url="/login")
+    return await call_next(request)
 
 async def background_monitoring_agent():
     while True:
@@ -354,6 +422,20 @@ ALERTS_SCRIPT = """
                 }
             });
         }
+
+        const testBtn = document.getElementById('ccai-test-alert');
+        if (testBtn) {
+            testBtn.addEventListener('click', function() {
+                // Same click-gesture unlock as the Enable Alerts button, so
+                // Test Alert works even if the user never clicked that one.
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+                handleEvent({
+                    event_type: 'MEDICINE_DUE',
+                    status: 'This is a test alert. If you can see and hear this, alerts are working correctly.'
+                });
+            });
+        }
     });
 })();
 </script>
@@ -407,6 +489,8 @@ def get_shared_layout(page_title: str, main_content: str) -> str:
                 </div>
                 <div class="border-t border-white/10 pt-4 space-y-2">
                     <button id="ccai-enable-alerts" class="w-full flex items-center justify-center space-x-2 px-4 py-2 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 text-indigo-300 transition font-semibold text-xs">🔔 Enable Alerts</button>
+                    <button id="ccai-test-alert" class="w-full flex items-center justify-center space-x-2 px-4 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 text-emerald-300 transition font-semibold text-xs">🔊 Test Alert</button>
+                    <a href="/logout" class="w-full flex items-center justify-center space-x-2 px-4 py-2 rounded-xl hover:bg-red-500/10 text-red-300 transition font-semibold text-xs block">🔒 Log Out</a>
                     <div class="text-[11px] text-slate-500 px-4">True Multi-Page Routing Stack v3.2</div>
                 </div>
             </aside>
@@ -418,6 +502,95 @@ def get_shared_layout(page_title: str, main_content: str) -> str:
     </body>
     </html>
     """
+
+# -----------------------------------------------------------------------------
+# LOGIN / LOGOUT (JWT-based)
+# -----------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+def page_login(error: str = None):
+    error_box = ""
+    if error == "1":
+        error_box = '<p class="text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2 text-xs font-semibold mb-4">Incorrect username or password.</p>'
+    elif error == "locked":
+        error_box = f'<p class="text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2 text-xs font-semibold mb-4">Too many failed attempts. Try again in {LOGIN_LOCKOUT_SECONDS} seconds.</p>'
+
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>CareCompanionAI - Login</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+            body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}
+        </style>
+    </head>
+    <body class="bg-gradient-to-tr from-slate-950 via-slate-900 to-indigo-950 min-h-screen text-slate-100 antialiased flex items-center justify-center p-6">
+        <div class="w-full max-w-sm">
+            <div class="text-center mb-8">
+                <div class="text-4xl mb-3">🛡️</div>
+                <h1 class="text-2xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent">CareCompanion</h1>
+                <p class="text-slate-400 text-sm mt-1">Sign in to continue</p>
+            </div>
+            <form action="/login" method="POST" class="bg-white/5 border border-white/10 rounded-2xl p-6 shadow-xl space-y-4">
+                {error_box}
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 mb-1">USERNAME</label>
+                    <input type="text" name="username" required autofocus placeholder="admin" class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 mb-1">PASSWORD</label>
+                    <input type="password" name="password" required placeholder="••••••••" class="w-full bg-black/20 border border-white/10 rounded-xl px-3 py-2.5 text-white text-sm focus:outline-none focus:border-indigo-500 transition">
+                </div>
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-4 rounded-xl transition text-xs tracking-wider uppercase shadow-lg shadow-indigo-600/20">Sign In</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """)
+
+@app.post("/login")
+def action_login(request: Request, username: str = Form(...), password: str = Form(...)):
+    client_ip = request.client.host if request.client else "unknown"
+
+    if is_ip_locked_out(client_ip):
+        return RedirectResponse(url="/login?error=locked", status_code=303)
+
+    if username == APP_USERNAME and password == APP_PASSWORD:
+        _failed_login_attempts.pop(client_ip, None)
+        token = create_jwt_token(username)
+        resp = RedirectResponse(url="/", status_code=303)
+        resp.set_cookie(
+            key=COOKIE_NAME,
+            value=token,
+            httponly=True,
+            samesite="lax",
+            max_age=JWT_EXPIRY_HOURS * 3600,
+        )
+        return resp
+
+    register_failed_login(client_ip)
+    return RedirectResponse(url="/login?error=1", status_code=303)
+
+@app.get("/logout")
+def action_logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    resp.delete_cookie(COOKIE_NAME)
+    return resp
+
+# -----------------------------------------------------------------------------
+# HEALTH CHECK (public — no auth required)
+# -----------------------------------------------------------------------------
+# Ping this endpoint with a free uptime service (UptimeRobot, cron-job.org,
+# etc.) every ~10 minutes. Render's free tier spins a service down after ~15
+# minutes of no traffic — and while it's asleep, the background monitoring
+# agent isn't running either, so NO alerts (beeps, pop-ups, or otherwise) can
+# fire. Keeping this endpoint pinged keeps the whole alert system alive.
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 # -----------------------------------------------------------------------------
 # REAL ROUTED PAGES CHANNELS
